@@ -1,18 +1,24 @@
 # Adapted from https://github.com/guoyww/AnimateDiff/blob/main/animatediff/pipelines/pipeline_animation.py
 
 import inspect
+import json
 import math
 import os
 import shutil
-from typing import Callable, List, Optional, Union
 import subprocess
+from hashlib import sha1
+from pathlib import Path
+from typing import Callable, Dict, Hashable, List, Optional, Union
 
+import cv2
 import numpy as np
+import soundfile as sf
 import torch
 import torchvision
-from torchvision import transforms
-
+import tqdm
+from einops import rearrange
 from packaging import version
+from torchvision import transforms
 
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models import AutoencoderKL
@@ -27,15 +33,10 @@ from diffusers.schedulers import (
 )
 from diffusers.utils import deprecate, logging
 
-from einops import rearrange
-import cv2
-
 from ..models.unet import UNet3DConditionModel
-from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
+from ..utils.util import check_ffmpeg_installed, read_audio, read_video, write_video
 from ..whisper.audio2feature import Audio2Feature
-import tqdm
-import soundfile as sf
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -117,6 +118,34 @@ class LipsyncPipeline(DiffusionPipeline):
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
         self.set_progress_bar_config(desc="Steps")
+
+        # Disk-backed cache for expensive video-only analysis so that multiple
+        # runs and processes can reuse the same preprocessing results.
+        #
+        # Cache layout (per entry):
+        #   <video_cache_dir>/<hash>/
+        #       meta.json
+        #       video_frames.npz
+        #       faces.pt
+        #       boxes.json
+        #       affine_matrices.pt
+        default_cache_dir = os.environ.get("LATENTSYNC_VIDEO_CACHE")
+        if default_cache_dir is None:
+            # Follow XDG cache dir if available, otherwise fallback to ~/.cache
+            xdg_cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+                os.path.expanduser("~"), ".cache"
+            )
+            default_cache_dir = os.path.join(xdg_cache_home, "latentsync", "video_analysis")
+
+        self.video_cache_dir: str = default_cache_dir
+        self.enable_video_disk_cache: bool = True
+        self._video_cache_format_version: int = 1
+
+        # Lazily create the cache directory; ignore errors to avoid breaking inference.
+        try:
+            os.makedirs(self.video_cache_dir, exist_ok=True)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to create video cache directory '%s'", self.video_cache_dir)
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -249,6 +278,202 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
+    # ---------------------------------------------------------------------
+    # Video analysis and disk cache helpers
+    # ---------------------------------------------------------------------
+
+    def _make_video_cache_key(
+        self,
+        video_path: str,
+        height: int,
+        video_fps: int,
+    ) -> Dict[str, Hashable]:
+        """Build a metadata key describing the video and processing settings.
+
+        This key is serialized and hashed to determine the on-disk cache
+        location and to validate that a cache entry is still valid.
+        """
+        abs_video_path = os.path.abspath(video_path)
+        try:
+            stat_result = os.stat(abs_video_path)
+            file_size = stat_result.st_size
+            mtime = stat_result.st_mtime
+        except OSError:
+            # If the file is missing, we still return a key; the caller
+            # will hit a cache miss and then likely fail when trying
+            # to actually read the video.
+            file_size = None
+            mtime = None
+
+        key = {
+            "video_path": abs_video_path,
+            "file_size": file_size,
+            "mtime": mtime,
+            "height": int(height),
+            "width": int(height),
+            "video_fps": int(video_fps),
+            "format_version": self._video_cache_format_version,
+        }
+        return key
+
+    @staticmethod
+    def _hash_cache_key(key: Dict[str, Hashable]) -> str:
+        """Return a stable hash for a cache key dictionary."""
+        # Use a deterministic JSON representation for hashing
+        key_bytes = json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return sha1(key_bytes).hexdigest()
+
+    def _get_cache_entry_dir(self, key: Dict[str, Hashable]) -> Path:
+        """Return the directory where this key's cache entry should live."""
+        key_hash = self._hash_cache_key(key)
+        return Path(self.video_cache_dir) / key_hash
+
+    def _load_video_analysis_from_cache(
+        self, key: Dict[str, Hashable]
+    ) -> Optional[Dict[str, Union[np.ndarray, torch.Tensor, List]]]:
+        """Try to load video analysis results from the disk cache.
+
+        Returns:
+            A dict with keys: video_frames, faces, boxes, affine_matrices
+            or None if the cache entry is missing or invalid.
+        """
+        if not self.enable_video_disk_cache:
+            return None
+
+        entry_dir = self._get_cache_entry_dir(key)
+        meta_path = entry_dir / "meta.json"
+        if not meta_path.exists():
+            return None
+
+        try:
+            with meta_path.open("r", encoding="utf-8") as f:
+                cached_meta = json.load(f)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+        # Validate metadata: if anything differs from the expected key,
+        # consider the cache entry stale.
+        for k, v in key.items():
+            if cached_meta.get(k) != v:
+                return None
+
+        try:
+            video_npz_path = entry_dir / "video_frames.npz"
+            faces_path = entry_dir / "faces.pt"
+            boxes_path = entry_dir / "boxes.json"
+            affine_path = entry_dir / "affine_matrices.pt"
+
+            if not (video_npz_path.exists() and faces_path.exists() and boxes_path.exists() and affine_path.exists()):
+                return None
+
+            with np.load(video_npz_path, allow_pickle=False) as npz_file:
+                video_frames = npz_file["video_frames"]
+
+            faces = torch.load(faces_path, map_location="cpu")
+            with boxes_path.open("r", encoding="utf-8") as f:
+                boxes = json.load(f)
+            affine_matrices = torch.load(affine_path, map_location="cpu")
+
+            logger.info("Loaded video analysis from cache: %s", entry_dir)
+            return {
+                "video_frames": video_frames,
+                "faces": faces,
+                "boxes": boxes,
+                "affine_matrices": affine_matrices,
+            }
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to load video analysis cache from '%s': %s", entry_dir, exc)
+            return None
+
+    def _save_video_analysis_to_cache(
+        self,
+        key: Dict[str, Hashable],
+        video_frames: np.ndarray,
+        faces: torch.Tensor,
+        boxes: List,
+        affine_matrices: List,
+    ) -> None:
+        """Persist video analysis results to disk cache."""
+        if not self.enable_video_disk_cache:
+            return
+
+        entry_dir = self._get_cache_entry_dir(key)
+
+        try:
+            entry_dir.mkdir(parents=True, exist_ok=True)
+            meta_path = entry_dir / "meta.json"
+            video_npz_path = entry_dir / "video_frames.npz"
+            faces_path = entry_dir / "faces.pt"
+            boxes_path = entry_dir / "boxes.json"
+            affine_path = entry_dir / "affine_matrices.pt"
+
+            with meta_path.open("w", encoding="utf-8") as f:
+                json.dump(key, f)
+
+            # Save video frames as compressed NumPy array
+            np.savez_compressed(video_npz_path, video_frames=video_frames)
+
+            # Faces and affine matrices are PyTorch tensors; serialize with torch.save
+            torch.save(faces, faces_path)
+            torch.save(affine_matrices, affine_path)
+
+            # Boxes are a simple list of coordinates
+            with boxes_path.open("w", encoding="utf-8") as f:
+                json.dump(boxes, f)
+
+            logger.info("Saved video analysis to cache: %s", entry_dir)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to save video analysis cache to '%s': %s", entry_dir, exc)
+
+    def _compute_video_analysis(
+        self,
+        video_path: str,
+        height: int,
+        video_fps: int,
+    ) -> Dict[str, Union[np.ndarray, torch.Tensor, List]]:
+        """Compute video-only analysis for a given video.
+
+        This method performs the expensive steps:
+          * Reading and converting the video to a fixed FPS.
+          * Running face detection and affine alignment per frame.
+        """
+        # Read video frames at the target FPS (25 by default in read_video)
+        video_frames = read_video(video_path, use_decord=False)
+
+        # For the base analysis we always analyze the full video.
+        faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+
+        return {
+            "video_frames": video_frames,
+            "faces": faces,
+            "boxes": boxes,
+            "affine_matrices": affine_matrices,
+        }
+
+    def _get_or_compute_video_analysis(
+        self,
+        video_path: str,
+        height: int,
+        video_fps: int,
+    ) -> Dict[str, Union[np.ndarray, torch.Tensor, List]]:
+        """Get video analysis either from disk cache or by computing it."""
+        key = self._make_video_cache_key(video_path, height, video_fps)
+
+        if self.enable_video_disk_cache:
+            cached = self._load_video_analysis_from_cache(key)
+            if cached is not None:
+                return cached
+
+        analysis = self._compute_video_analysis(video_path, height, video_fps)
+        self._save_video_analysis_to_cache(
+            key,
+            analysis["video_frames"],
+            analysis["faces"],
+            analysis["boxes"],
+            analysis["affine_matrices"],
+        )
+        return analysis
+
     def affine_transform_video(self, video_frames: np.ndarray):
         faces = []
         boxes = []
@@ -278,34 +503,54 @@ class LipsyncPipeline(DiffusionPipeline):
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
-        # If the audio is longer than the video, we need to loop the video
-        if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
-            num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
-            loop_video_frames = []
-            loop_faces = []
-            loop_boxes = []
-            loop_affine_matrices = []
+    def loop_video(
+        self,
+        whisper_chunks: List,
+        base_video_frames: np.ndarray,
+        base_faces: torch.Tensor,
+        base_boxes: List,
+        base_affine_matrices: List,
+    ):
+        """Loop or truncate base video analysis to match the audio length.
+
+        The original implementation recomputed face alignment on the fly
+        every time. Here we instead reuse precomputed base analysis and
+        build the final sequences using index mappings, so repeated runs
+        with the same video can reuse disk-cached results.
+        """
+        num_audio = len(whisper_chunks)
+        num_video = len(base_video_frames)
+
+        if num_video == 0 or num_audio == 0:
+            raise ValueError("Video frames and whisper chunks must both be non-empty.")
+
+        # If the audio is longer than the video, we need to loop the video.
+        # We follow the same pattern as the original implementation: forward
+        # sequence, then reversed, repeated as needed.
+        if num_audio > num_video:
+            num_loops = math.ceil(num_audio / num_video)
+            index_map: List[int] = []
+            base_indices = list(range(num_video))
+            rev_indices = base_indices[::-1]
+
             for i in range(num_loops):
                 if i % 2 == 0:
-                    loop_video_frames.append(video_frames)
-                    loop_faces.append(faces)
-                    loop_boxes += boxes
-                    loop_affine_matrices += affine_matrices
+                    index_map.extend(base_indices)
                 else:
-                    loop_video_frames.append(video_frames[::-1])
-                    loop_faces.append(faces.flip(0))
-                    loop_boxes += boxes[::-1]
-                    loop_affine_matrices += affine_matrices[::-1]
+                    index_map.extend(rev_indices)
 
-            video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
-            faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
-            boxes = loop_boxes[: len(whisper_chunks)]
-            affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
+            index_map = index_map[:num_audio]
         else:
-            video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            # Audio is shorter; just take the first num_audio frames.
+            index_map = list(range(num_audio))
+
+        # Build looped/truncated sequences using the index map.
+        index_tensor = torch.tensor(index_map, dtype=torch.long)
+
+        video_frames = base_video_frames[index_map]
+        faces = base_faces.index_select(0, index_tensor)
+        boxes = [base_boxes[i] for i in index_map]
+        affine_matrices = [base_affine_matrices[i] for i in index_map]
 
         return video_frames, faces, boxes, affine_matrices
 
@@ -365,9 +610,17 @@ class LipsyncPipeline(DiffusionPipeline):
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
         audio_samples = read_audio(audio_path)
-        video_frames = read_video(video_path, use_decord=False)
 
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        # 5. Video analysis (with disk-backed caching)
+        video_analysis = self._get_or_compute_video_analysis(video_path, height, video_fps)
+        base_video_frames = video_analysis["video_frames"]
+        base_faces = video_analysis["faces"]
+        base_boxes = video_analysis["boxes"]
+        base_affine_matrices = video_analysis["affine_matrices"]
+
+        video_frames, faces, boxes, affine_matrices = self.loop_video(
+            whisper_chunks, base_video_frames, base_faces, base_boxes, base_affine_matrices
+        )
 
         synced_video_frames = []
 

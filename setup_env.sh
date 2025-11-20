@@ -14,5 +14,18 @@ pip install -r requirements.txt
 sudo apt -y install libgl1
 
 # Download the checkpoints required for inference from HuggingFace
-huggingface-cli download ByteDance/LatentSync-1.6 whisper/tiny.pt --local-dir checkpoints
-huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
+# Prefer the modern `hf` CLI (from huggingface_hub[cli]); fall back to
+# legacy `huggingface-cli` if present.
+if command -v hf >/dev/null 2>&1; then
+  HF_CLI="hf"
+elif command -v huggingface-cli >/dev/null 2>&1; then
+  HF_CLI="huggingface-cli"
+else
+  echo "No Hugging Face CLI found. Please install it, e.g.:"
+  echo "  pip install 'huggingface_hub[cli]'"
+  exit 1
+fi
+
+mkdir -p checkpoints
+$HF_CLI download ByteDance/LatentSync-1.6 whisper/tiny.pt --local-dir checkpoints
+$HF_CLI download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
