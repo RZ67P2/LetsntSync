@@ -24,10 +24,52 @@ fi
 # 2. System dependencies (ffmpeg, libgl)
 ##############################################
 
+check_system_deps() {
+  local missing_deps=()
+  
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    missing_deps+=("ffmpeg")
+  fi
+  
+  # Check for libgl1 (OpenGL library) - this is harder to check directly,
+  # but we can check if common OpenGL libraries exist
+  if [[ ! -f /usr/lib/x86_64-linux-gnu/libGL.so.1 ]] && \
+     [[ ! -f /usr/lib/aarch64-linux-gnu/libGL.so.1 ]] && \
+     [[ ! -f /usr/lib/libGL.so.1 ]]; then
+    # Don't add to missing_deps as it might be available via other paths
+    # Just note it for the user
+    echo "[LatentSync] Warning: libGL.so.1 not found in common locations (may still work)"
+  fi
+  
+  if [[ ${#missing_deps[@]} -gt 0 ]]; then
+    echo "[LatentSync] Missing system dependencies: ${missing_deps[*]}"
+    return 1
+  else
+    echo "[LatentSync] System dependencies (ffmpeg) are available."
+    return 0
+  fi
+}
+
 install_ubuntu_deps() {
-  echo "[LatentSync] Detected apt-get. Installing ffmpeg and libgl1 via apt..."
-  sudo apt-get update
-  sudo apt-get install -y --no-install-recommends ffmpeg libgl1
+  echo "[LatentSync] Attempting to install missing system dependencies..."
+  
+  # Check if sudo is available
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "[LatentSync] sudo not available (common in cloud environments like RunPod)."
+    echo "[LatentSync] Assuming system packages are pre-installed in the base image."
+    return 0
+  fi
+  
+  # Try to install with sudo (may fail in restricted environments)
+  if sudo -n true 2>/dev/null || sudo -v 2>/dev/null; then
+    echo "[LatentSync] Installing ffmpeg and libgl1 via apt..."
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends ffmpeg libgl1
+  else
+    echo "[LatentSync] Cannot use sudo (restricted environment)."
+    echo "[LatentSync] Assuming system packages are pre-installed in the base image."
+    return 0
+  fi
 }
 
 install_macos_hint() {
@@ -35,14 +77,26 @@ install_macos_hint() {
   echo "  brew install ffmpeg"
 }
 
-if command -v apt-get >/dev/null 2>&1; then
-  install_ubuntu_deps
+# Check if dependencies are already available
+if check_system_deps; then
+  echo "[LatentSync] All required system dependencies are present."
 else
-  echo "[LatentSync] apt-get not found; skipping automatic system package install."
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    install_macos_hint
+  # Try to install if we can
+  if command -v apt-get >/dev/null 2>&1; then
+    install_ubuntu_deps
+    # Re-check after installation attempt
+    if ! check_system_deps; then
+      echo "[LatentSync] Warning: Some system dependencies may be missing."
+      echo "[LatentSync] The script will continue, but LatentSync may fail if ffmpeg is not available."
+    fi
   else
-    echo "[LatentSync] Please install ffmpeg and libgl1 (or equivalent) manually for your distribution."
+    echo "[LatentSync] apt-get not found; skipping automatic system package install."
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      install_macos_hint
+    else
+      echo "[LatentSync] Please ensure ffmpeg is installed manually for your distribution."
+      echo "[LatentSync] On cloud platforms (RunPod, etc.), these are usually pre-installed."
+    fi
   fi
 fi
 
